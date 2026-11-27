@@ -1,7 +1,8 @@
 import argparse
 import asyncio
 import base64
-from collections import OrderedDict
+from collections import Counter, OrderedDict
+from datetime import date, datetime
 import hmac
 import json
 import logging
@@ -18,8 +19,10 @@ from dotenv import dotenv_values
 from fastapi import BackgroundTasks, FastAPI, HTTPException, Request, Response
 import uvicorn
 
-from agenda import Agenda
 from codex_client import ask_codex, CodexError, find_codex
+from dashboard_server import mount_dashboard
+from line_booking_menu import BookingMenu, handle_booking_postback, handle_booking_text, with_booking_menu
+from reservations import booking_instructions, DEFAULT_DURATION_MINUTES, ReservationBook, SplitOffer, TAIPEI_TIME
 
 
 ROOT = Path(__file__).resolve().parent
@@ -27,14 +30,44 @@ LOGGER = logging.getLogger("uvicorn.error")
 MAX_WEBHOOK_BYTES = 256 * 1024
 MAX_INPUT_CHARACTERS = 3000
 REPLY_URL = "https://api.line.me/v2/bot/message/reply"
+SPLIT_POSTBACK = re.compile(r"split:([0-9a-f]{32}):([1-4](?:,[1-4]){1,11})")
 
 
-def send_reply(access_token: str, reply_token: str, answer: str) -> None:
+def _split_label(split: tuple[int, ...]) -> str:
+    label = "＋".join(str(group) for group in split)
+    if len(label) <= 20:
+        return label
+    return "＋".join(f"{group}×{count}" if count > 1 else str(group) for group, count in Counter(split).items())
+
+
+def _line_message_date(timestamp: object) -> date | None:
+    if type(timestamp) is not int:
+        return None
+    try:
+        return datetime.fromtimestamp(timestamp / 1000, TAIPEI_TIME).date()
+    except (OverflowError, OSError, ValueError):
+        return None
+
+
+def send_reply(access_token: str, reply_token: str, answer: str | SplitOffer | BookingMenu) -> None:
     # LINE counts text limits in UTF-16 code units.
-    text = answer.encode("utf-16-le")[:9000].decode("utf-16-le", errors="ignore")
+    text = answer.text if isinstance(answer, (SplitOffer, BookingMenu)) else answer
+    message = {"type": "text", "text": text.encode("utf-16-le")[:9000].decode("utf-16-le", errors="ignore")}
+    if isinstance(answer, SplitOffer):
+        items = []
+        for split in answer.options:
+            label = _split_label(split)
+            groups = ",".join(map(str, split))
+            items.append({"type": "action", "action": {
+                "type": "postback", "label": label, "displayText": f"選擇拆桌 {label}",
+                "data": f"split:{answer.offer_id}:{groups}",
+            }})
+        message["quickReply"] = {"items": items}
+    elif isinstance(answer, BookingMenu):
+        message["quickReply"] = {"items": [{"type": "action", "action": action} for action in answer.actions]}
     request = OutgoingRequest(
         REPLY_URL,
-        data=json.dumps({"replyToken": reply_token, "messages": [{"type": "text", "text": text}]}).encode("utf-8"),
+        data=json.dumps({"replyToken": reply_token, "messages": [message]}).encode("utf-8"),
         headers={"Authorization": f"Bearer {access_token}", "Content-Type": "application/json"},
         method="POST",
     )
@@ -50,37 +83,48 @@ def send_reply(access_token: str, reply_token: str, answer: str) -> None:
 def create_app(
     secret: str,
     access_token: str,
-    owner_id: str,
-    executable: str,
-    model: str | None,
     *,
-    agenda_path: Path | None = None,
+    reservation_path: Path | None = None,
+    duration_minutes: int = DEFAULT_DURATION_MINUTES,
+    dashboard_access_key: str | None = None,
+    dashboard_site_origin: str | None = None,
+    dashboard_management_key: str | None = None,
 ) -> FastAPI:
     app = FastAPI(docs_url=None, redoc_url=None, openapi_url=None)
-    agenda = Agenda(agenda_path or (ROOT / ".runtime" / "agenda.sqlite3"))
-    running = asyncio.Lock()
+    book = ReservationBook(reservation_path or (ROOT / ".runtime" / "reservations.sqlite3"), duration_minutes)
+    mount_dashboard(app, book, dashboard_access_key, dashboard_site_origin, dashboard_management_key)
     seen_events: OrderedDict[str, float] = OrderedDict()
 
-    async def process_message(event_id: str, reply_token: str, text: str) -> None:
-        if len(text) > MAX_INPUT_CHARACTERS:
-            answer = f"請把訊息縮短為 {MAX_INPUT_CHARACTERS} 字以內後再傳送。"
-        elif running.locked():
-            answer = "我正在回覆上一則訊息，請稍後再傳一次。"
-        else:
-            async with running:
-                try:
-                    answer = await asyncio.to_thread(agenda.reply, executable, model, owner_id, event_id, text)
-                except CodexError as exc:
-                    LOGGER.warning("%s", exc)
-                    answer = "AI 暫時無法回覆，請稍後再傳一次。"
-                except (sqlite3.Error, OSError) as exc:
-                    LOGGER.error("讀寫行程資料庫失敗（%s）。", type(exc).__name__)
-                    answer = "行程資料暫時無法讀取或儲存，請稍後再試。"
-        if answer:
-            await asyncio.to_thread(send_reply, access_token, reply_token, answer)
+    async def process_message(
+        customer_id: str, event_id: str, reply_token: str, kind: str, content: str, sent_on: date | None,
+        selected_datetime: str | None,
+    ) -> None:
+        try:
+            if kind == "postback":
+                selection = SPLIT_POSTBACK.fullmatch(content)
+                if selection:
+                    offer_id, groups = selection.groups()
+                    split = tuple(int(group) for group in groups.split(","))
+                    answer = with_booking_menu(await asyncio.to_thread(book.choose_split, customer_id, offer_id, split))
+                else:
+                    answer = await asyncio.to_thread(
+                        handle_booking_postback, book, customer_id, event_id, content, selected_datetime,
+                    )
+                    if answer is None:
+                        return
+            elif len(content) > MAX_INPUT_CHARACTERS:
+                answer = f"訂位訊息太長。\n\n{booking_instructions()}"
+            else:
+                answer = await asyncio.to_thread(
+                    handle_booking_text, book, customer_id, event_id, content, sent_on=sent_on,
+                )
+        except (sqlite3.Error, OSError) as exc:
+            LOGGER.error("讀寫訂位資料庫失敗（%s）。", type(exc).__name__)
+            answer = "訂位暫時無法處理，請稍後重傳完整訂位訊息。"
+        await asyncio.to_thread(send_reply, access_token, reply_token, answer)
 
-    async def process_batch(messages: list[tuple[str, str, str]]) -> None:
-        await asyncio.gather(*(process_message(event_id, token, text) for event_id, token, text in messages))
+    async def process_batch(messages: list[tuple[str, str, str, str, str, date | None, str | None]]) -> None:
+        await asyncio.gather(*(process_message(*message) for message in messages))
 
     @app.get("/health")
     async def health():
@@ -115,20 +159,35 @@ def create_app(
 
         messages = []
         for event in payload["events"]:
-            if not isinstance(event, dict) or event.get("type") != "message" or event.get("mode") != "active":
+            if not isinstance(event, dict) or event.get("mode") != "active":
                 continue
-            source, message = event.get("source"), event.get("message")
-            if not isinstance(source, dict) or source.get("type") != "user" or source.get("userId") != owner_id:
+            kind = event.get("type")
+            if kind not in ("message", "postback"):
                 continue
-            if not isinstance(message, dict) or message.get("type") != "text":
+            source, data = event.get("source"), event.get(kind)
+            if not isinstance(source, dict) or source.get("type") != "user" or not isinstance(data, dict):
                 continue
-            text, token, event_id = message.get("text"), event.get("replyToken"), event.get("webhookEventId")
-            if not all(isinstance(value, str) and value.strip() for value in (text, token, event_id)):
+            token, event_id = event.get("replyToken"), event.get("webhookEventId")
+            if not all(isinstance(value, str) and value.strip() for value in (token, event_id)):
                 continue
             if event_id in seen_events:
                 continue
             seen_events[event_id] = now
-            messages.append((event_id, token, text))
+            customer_id = source.get("userId")
+            selected_datetime = None
+            if kind == "postback":
+                content = data.get("data")
+                params = data.get("params")
+                if isinstance(params, dict) and isinstance(params.get("datetime"), str):
+                    selected_datetime = params["datetime"]
+            else:
+                content = data.get("text") if data.get("type") == "text" else ""
+            if not isinstance(customer_id, str):
+                customer_id = ""
+            if not isinstance(content, str):
+                content = ""
+            sent_on = _line_message_date(event.get("timestamp")) if kind == "message" else None
+            messages.append((customer_id, event_id, token, kind, content, sent_on, selected_datetime))
 
         if messages:
             background_tasks.add_task(process_batch, messages)
@@ -138,7 +197,7 @@ def create_app(
 
 
 def main() -> int:
-    parser = argparse.ArgumentParser(description="透過本機 Codex 回覆 LINE 訊息")
+    parser = argparse.ArgumentParser(description="LINE 餐廳訂位助理")
     commands = parser.add_subparsers(dest="command", required=True)
     smoke = commands.add_parser("ask", help="在本機測試 Codex 回覆")
     smoke.add_argument("message")
@@ -147,22 +206,33 @@ def main() -> int:
     args = parser.parse_args()
 
     settings = {**dotenv_values(ROOT / ".env", encoding="utf-8-sig", interpolate=False), **os.environ}
-    try:
-        executable = find_codex(settings.get("CODEX_BIN"))
-        model = settings.get("CODEX_MODEL") or None
-        if args.command == "ask":
+    if args.command == "ask":
+        try:
+            executable = find_codex(settings.get("CODEX_BIN"))
+            model = settings.get("CODEX_MODEL") or None
             print(ask_codex(executable, model, args.message))
             return 0
+        except CodexError as exc:
+            print(exc, file=sys.stderr)
+            return 1
 
-        secret = settings.get("LINE_CHANNEL_SECRET") or ""
-        access_token = settings.get("LINE_CHANNEL_ACCESS_TOKEN") or ""
-        owner_id = settings.get("LINE_OWNER_USER_ID") or ""
-        if not secret or not access_token or not re.fullmatch(r"U[0-9a-f]{32}", owner_id):
-            parser.error("請先依 README 填寫 .env 的 LINE_CHANNEL_SECRET、LINE_CHANNEL_ACCESS_TOKEN 和 LINE_OWNER_USER_ID。")
-        uvicorn.run(create_app(secret, access_token, owner_id, executable, model), host="127.0.0.1", port=args.port)
-    except CodexError as exc:
-        print(exc, file=sys.stderr)
-        return 1
+    secret = settings.get("LINE_CHANNEL_SECRET") or ""
+    access_token = settings.get("LINE_CHANNEL_ACCESS_TOKEN") or ""
+    if not secret or not access_token:
+        parser.error("請依 README 填寫 .env 的 LINE_CHANNEL_SECRET 和 LINE_CHANNEL_ACCESS_TOKEN。")
+    try:
+        duration = int(settings.get("RESERVATION_DURATION_MINUTES") or DEFAULT_DURATION_MINUTES)
+        if not 1 <= duration <= 180:
+            raise ValueError
+    except ValueError:
+        parser.error("RESERVATION_DURATION_MINUTES 請填 1 到 180 之間的整數。")
+    uvicorn.run(
+        create_app(secret, access_token, duration_minutes=duration,
+                   dashboard_access_key=settings.get("DASHBOARD_ACCESS_TOKEN"),
+                   dashboard_site_origin=settings.get("DASHBOARD_SITE_ORIGIN"),
+                   dashboard_management_key=settings.get("DASHBOARD_MANAGEMENT_TOKEN")),
+        host="127.0.0.1", port=args.port,
+    )
     return 0
 
 

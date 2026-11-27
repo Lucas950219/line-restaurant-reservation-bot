@@ -1,88 +1,89 @@
-# LINE AI 助理
+# LINE 餐廳訂位助理
 
-這是給自己使用的 LINE 排程助理。LINE 官方帳號收到你的私訊後，會把事件送到這台 Windows 電腦。Python 驗證 LINE 簽章與發送者，再呼叫 VS Code 擴充套件附帶的 Codex CLI 來理解文字、補問缺少的行程資料，最後透過 LINE Messaging API 把答案回到原聊天室。
+顧客在 LINE 官方帳號的私訊中送出完整訂位資料。助理驗證營業時間、分配空桌，並回覆訂位編號。5 人以上先選每桌人數。輸入「訂位」可取得填寫範例。
+
+## 顧客怎麼訂位
+
+同一則訊息填齊四項資料。日期可填「今天」「明天」「後天」「大後天」「下週一」「11月30日」或完整日期。相對日期以訊息送出時的台灣日期換算，只填月日時採該年的日期。
 
 ```text
-LINE 私訊 → LINE 官方帳號 → 公開 HTTPS /webhook → 本機 Python
-                                                      ↓
-LINE 聊天室 ← LINE Messaging API ← Python ← Codex CLI → OpenAI
+日期：明天
+時間：11:30
+人數：4
+聯絡方式：0912345678
 ```
 
-## 用 LINE 記錄行程
+一行就能訂位，例如 `後天 18:00 2 0912345678`、`明天晚上六點八個人guest@example.com`，或 `我要訂位八位明天晚上6:30，電話：0912-345-678`。時間接受 `18:00`、`晚上六點`、`晚上六點半` 等寫法；寫「六點」時請補上時段，例如「晚上六點」。聯絡方式接受電話或電子郵件。資料漏填或格式有誤時，助理會提供範例，請顧客重傳完整訊息。
 
-1. 傳送「明天下午三點開會」。助理會保留日期、時間和事項，詢問地點及參加對象。
-2. 回覆「在七樓會議室」，再回覆「跟小王和小陳」，或把地點和對象寫在同一則訊息。尚未決定的資料可以說「地點先寫未定」。
-3. 資料填齊後，助理會回傳已存的日期、時間、事項、地點和對象。用「今天行程」「明天行程」或「接下來有哪些行程」查詢。想放棄還在補資料的這筆行程，可傳送「取消記錄」。
+如果輸入 `明天 18:00 8 guest@example.com`，助理會在 LINE 顯示當下可用的拆桌按鈕，例如 **4＋4** 或 **2＋2＋4**。顧客須在 10 分鐘內、且在訂位時間前點選。機器人會在點選時重新確認空桌，再一次保留所有桌並回傳一組訂位編號。如果原拆法已滿，會顯示其他可用拆法。 [LINE 快速回覆按鈕](https://developers.line.biz/en/docs/messaging-api/using-quick-reply/)
 
-日期以台灣時間 UTC+8 為準。只有時間時，若今天該時間尚未過，先使用今天；已過則會追問要記在哪一天。行程和未完成的草稿保存在本機 `.runtime/agenda.sqlite3`，服務重新啟動後仍可查詢或接續補資料。
+## 初版訂位規則
 
-## 1. 測試 VS Code 的 Codex
+| 項目 | 設定 |
+| --- | --- |
+| 營業時間 | 每天 11:30–14:30、17:00–20:00，採台灣時間 |
+| 桌位 | 6 張雙人桌、6 張四人桌 |
+| 分桌 | 1–2 人優先安排雙人桌，雙人桌不足時可安排四人桌。3–4 人安排四人桌。5–36 人按當下空桌選擇拆法；超過 36 人請洽餐廳。 |
+| 用餐時間 | 預設 90 分鐘，同一張桌的訂位時段不可重疊。午餐最晚可訂 13:00，晚餐最晚可訂 18:30。 |
+| 訂位資料 | 儲存於本機 `.runtime/reservations.sqlite3`，服務重啟後仍會保留。 |
 
-安裝 VS Code 的 Codex 擴充套件，在側欄用你的 ChatGPT 帳號登入。在同一個 Windows 帳號開啟 `line-ai-assistant` 資料夾並在 PowerShell 執行下列命令。需要 Python 3.11 或以上。 [Codex 擴充套件](https://learn.chatgpt.com/docs/codex/ide) · [Python 下載](https://www.python.org/downloads/windows/)
+要調整用餐時間，可在本機 `.env` 設定 `RESERVATION_DURATION_MINUTES`，單位為分鐘。已成立訂位保留原先的結束時間。新訂位及桌位檢查都在本機完成，聯絡方式保存在本機訂位資料庫。
+
+## 1. 安裝與啟動
+
+在 Windows PowerShell 進入專案資料夾。需要 Python 3.11 或以上。如果已建立專案的虛擬環境，可直接從「設定 LINE」開始。
 
 ```powershell
 python -m venv .venv
 .\.venv\Scripts\python.exe -m pip install -r requirements.txt
-.\.venv\Scripts\python.exe -X utf8 bot.py ask '請用一句話自我介紹'
+if (-not (Test-Path -LiteralPath '.env')) { Copy-Item -LiteralPath '.env.example' -Destination '.env' }
 ```
 
-程式優先從 `%USERPROFILE%\.vscode\extensions` 找 Codex 執行檔，再搜尋 `PATH`。CLI 可以使用和擴充套件共用的 ChatGPT 登入，此路徑無需在專案內申請或填入 OpenAI API Key。VS Code 視窗可以關閉。本機服務和網路需持續運作。 [Codex 登入與共用授權](https://learn.chatgpt.com/docs/auth#login-caching) · [Codex 非互動模式](https://learn.chatgpt.com/docs/non-interactive-mode)
+## 2. 設定 LINE
 
-如果 CLI 路徑不同，在 `.env` 設定 `CODEX_BIN` 為完整執行檔路徑。如果要指定與 VS Code 一樣的模型，在 `.env` 的 `CODEX_MODEL` 填入你的帳號可用的模型 ID。留空時由 CLI 選擇預設模型。每則 LINE 訊息開啟獨立的 Codex 請求。
+已有 LINE 官方帳號的 Messaging API Channel，可沿用同一組憑證。初次設定時，在 LINE Official Account Manager 建立官方帳號並啟用 Messaging API，再用同一個 Business ID 打開 LINE Developers Console 的 Channel。 [官方帳號管理後台](https://manager.line.biz/) · [LINE Developers Console](https://developers.line.biz/console/) · [開通指南](https://developers.line.biz/en/docs/messaging-api/getting-started/)
 
-## 2. 建立 LINE 官方帳號與授權
-
-1. 用 LINE 帳號在 LINE Official Account Manager 建立官方帳號。選擇帳號的 **設定 → Messaging API → 啟用 Messaging API**，建立或選擇 Provider。請先確認 Provider 選對，LINE 建立後無法改配。 [LINE 官方帳號管理後台](https://manager.line.biz/) · [開通 Messaging API](https://developers.line.biz/en/docs/messaging-api/getting-started/)
-2. 用同一個 Business ID 登入 **LINE Developers Console**，打開上述 Provider 裡的 Messaging API Channel。取得下表三項資料，填進本專案的 `.env`。如果看不到 **Your user ID**，先把手機的 LINE 帳號連結到 Business ID。 [LINE Developers Console](https://developers.line.biz/console/) · [取得自己的 User ID](https://developers.line.biz/en/docs/messaging-api/getting-user-ids/)
-
-| `.env` 欄位 | LINE 後台位置 | 用途 |
+| `.env` 欄位 | 後台位置 | 用途 |
 | --- | --- | --- |
-| `LINE_CHANNEL_SECRET` | **Basic settings → Channel secret** | 驗證收到的 webhook 確實來自 LINE |
-| `LINE_CHANNEL_ACCESS_TOKEN` | **Messaging API → Channel access token → Issue** | 讓後端能用官方帳號回覆訊息 |
-| `LINE_OWNER_USER_ID` | **Basic settings → Your user ID** | 只接受這個使用者的一對一私訊。格式為 `U` 加 32 個十六進位字元 |
+| `LINE_CHANNEL_SECRET` | Basic settings → Channel secret | 驗證收到的 LINE Webhook |
+| `LINE_CHANNEL_ACCESS_TOKEN` | Messaging API → Channel access token | 用官方帳號回覆顧客 |
 
-在專案開啟 PowerShell，複製設定範本，再用 VS Code 開啟 `.env` 填入這三項。
+把兩項資料填入本機的 `.env`。啟動訂位服務後，任何傳訊息給官方帳號的顧客都能在一對一聊天室訂位。
+
+## 3. 啟動後端與 Webhook
+
+在專案資料夾啟動服務。
 
 ```powershell
-if (-not (Test-Path -LiteralPath '.env')) { Copy-Item -LiteralPath '.env.example' -Destination '.env' }
-code .env
+.\.venv\Scripts\python.exe -X utf8 bot.py serve
 ```
 
-請將 Channel Secret 和 Access Token 留在你的 `.env`。此檔已由專案的 `.gitignore` 排除。個人私訊流程使用 Messaging API 的簽章與存取權杖，LINE Login 或 LIFF 可等到需要網頁登入時再加入。 [LINE 簽章驗證](https://developers.line.biz/en/docs/messaging-api/verify-webhook-signature/) · [Channel Access Token 說明](https://developers.line.biz/en/docs/basics/channel-access-token/)
+本機健康檢查可使用 `Invoke-RestMethod http://127.0.0.1:8000/health`。要從手機 LINE 測試，可用 cloudflared 建立臨時 HTTPS 網址。已安裝的專案本機版本位於 `.runtime/cloudflared.exe`。 [Cloudflare Quick Tunnel](https://developers.cloudflare.com/tunnel/get-started/quick-tunnels/)
 
-## 3. 啟動服務與設定 Webhook URL
+```powershell
+cloudflared tunnel --url http://127.0.0.1:8000
+```
 
-1. 在專案的第一個 PowerShell 視窗啟動後端。
+將 HTTPS 網址加上 `/webhook`，填到 LINE Developers Console 的 **Messaging API → Webhook settings**，按 **Verify** 並開啟 **Use webhook**。若收到預設罐頭回覆，可從 **Auto-reply messages → Edit** 前往管理後台關閉自動回覆。臨時通道重開後會換網址，屆時也要更新 LINE Webhook。 [LINE Webhook 和自動回覆設定](https://developers.line.biz/en/docs/messaging-api/building-bot/)
 
-   ```powershell
-   .\.venv\Scripts\python.exe -X utf8 bot.py serve
-   ```
+`bot.py ask` 可繼續用來測試本機 Codex。訂位訊息由本機程式直接解析，因此訂位回覆使用 LINE Messaging API 和本機 SQLite。
 
-2. 安裝 `cloudflared` 並在第二個 PowerShell 視窗開啟測試用 HTTPS 通道。將畫面顯示的 `trycloudflare.com` 網址加上 `/webhook`，例如 `https://你的臨時網址.trycloudflare.com/webhook`。 [cloudflared 下載](https://developers.cloudflare.com/tunnel/downloads/) · [Quick Tunnel](https://developers.cloudflare.com/tunnel/get-started/quick-tunnels/)
+## 店家訂位與備餐後台
 
-   ```powershell
-   cloudflared tunnel --url http://127.0.0.1:8000
-   ```
+開啟 `.runtime/dashboard-view-link.txt` 裡的店家專屬連結，即可在 GitHub Pages 查看唯讀看板。專屬連結包含查看權限，請只傳給有權查看訂位的人。顧客電話和電子郵件保存在本機訂位資料庫。
 
-3. 在 **LINE Developers Console → Messaging API → Webhook settings**，貼上完整 **Webhook URL**，點 **Verify**，成功後開啟 **Use webhook**。如果官方帳號的內建自動回覆已開啟，在管理後台的回應設定關閉它，以免收到兩份回覆。 [LINE Webhook 設定](https://developers.line.biz/en/docs/messaging-api/building-bot/)
-4. 掃描同一個 **Messaging API** 頁面的 QR Code，用你的手機 LINE 加官方帳號為好友，傳送「明天下午三點開會」。收到地點和對象的追問後，補完資料並用「明天行程」確認存檔。
+選擇營業日期可查看已成立的訂位、訂位時間、總人數和拆桌。備餐估算以每個餐期的已訂位人數乘上每人份數，再加上備量比例，最後向上取整。預設每位一份、備量 10%，可在頁面調整。
 
-Quick Tunnel 重新啟動後會換網址。每次換網址都要更新 LINE 的 Webhook URL。這個版本每次最多處理一則模型請求，Codex 有 40 秒的回覆期限，以便在 LINE 的 reply token 有效期內回覆。收到忙碌通知時，等上一則完成後再傳。 [LINE Reply token 規則](https://developers.line.biz/en/reference/messaging-api/#send-reply-message)
+看板會依實際分配的雙人桌與四人桌顯示各餐期的人數和桌次，明細也按桌型分欄。桌次是所選日期或餐期內的使用次數。
 
-| 目前卡住的地方 | 檢查方式 |
-| --- | --- |
-| `bot.py ask` 無法取得回覆 | 在同一個 Windows 帳號、VS Code 終端機執行 `codex login status`。若需要，從擴充套件重新登入。使用自訂模型時先清空 `CODEX_MODEL` 測試。 |
-| LINE Verify 失敗 | 確認 Python 和 HTTPS 通道已開啟、網址結尾是 `/webhook`、Channel Secret 屬於該 Channel。`Invoke-RestMethod http://127.0.0.1:8000/health` 可檢查本機服務。 |
-| Verify 成功但手機收不到回覆 | 確認已啟用 **Use webhook**、手機帳號和 `LINE_OWNER_USER_ID` 對應，查看後端終端機是否有 LINE API 錯誤。回覆 API 的 `401` 通常是存取權杖無效。 |
-| 收到官方帳號的罐頭文字 | 在 LINE Developers Console 的 **Messaging API** 分頁，於 **Auto-reply messages** 點 **Edit**，到管理後台的回應設定關閉自動回覆。如果罐頭文字是在加好友時收到，可以在同處關閉 **Greeting messages**。 [LINE 自動回覆設定](https://developers.line.biz/en/docs/messaging-api/building-bot/#settings-on-line-official-account-manager) |
+顧客在 LINE 聊天室輸入「功能」即可開啟快速選單，點選「我要訂位」、「我的訂位」、「改期訂位」或「取消訂位」。選單只顯示該 LINE 帳號即將到來的訂位。改期時用 LINE 的日期時間選擇器選擇台灣時間，取消前會顯示訂位內容並要求確認。也可輸入「取消 B000001」或「改期 B000001 明天晚上六點」，並換成自己的訂位編號。取消後會釋放桌位。新時段有足夠桌位時，改期會保留原編號與分桌人數。
 
-## 專案接下來可以做什麼
+店家可開啟 `.runtime/dashboard-manage-link.txt` 裡的專屬管理連結，直接取消或改期，也可以補登電話和現場訂位。店家補登的聯絡方式可留空。
 
-| 階段 | 功能與授權 |
-| --- | --- |
-| 排程紀錄 | 已支援口語新增、補問、取消草稿與查詢。可在 `assistant.txt` 修改一般回答的風格。 |
-| 任務與提醒 | 依已記錄的行程設定 LINE 主動推播。推播計入官方帳號訊息用量，即時回覆不計入。 [LINE 訊息計費說明](https://developers.line.biz/en/docs/messaging-api/pricing) |
-| 行事曆或待辦 | 選定服務後新增各自的 OAuth 授權，從讀取行事曆或待辦起步，再按需求加入建立和變更事件。 |
-| 長時間運作 | 使用固定 HTTPS 網址、常駐主機與程序管理。若繼續使用本機 Codex 登入，`.env`、服務程序與可使用 Codex 的 Windows 帳號需在該主機就緒。 |
+店家管理連結使用 `.env` 中獨立的 `DASHBOARD_MANAGEMENT_TOKEN`。原本的檢視連結仍是唯讀，管理連結只交給能調整訂位的人。
 
-程式在本機儲存行程資訊、待補欄位及近期已處理的排程事件 ID。通過授權的訊息文字與當前行程草稿會由本機 Codex 送往 OpenAI，供它判斷應如何回覆。Codex 以唯讀模式執行，程式停用終端機、網頁搜尋和擴充工具。
+GitHub Pages 的 `gh-pages` 分支發布 `dashboard/` 裡的 HTML、CSS 和 JavaScript。發布時把 HTML 的 `dashboard-api` 設成公開 HTTPS 通道加上 `/dashboard/reservations`，並在本機 `.env` 設定 `DASHBOARD_SITE_ORIGIN` 為 Pages 的來源網域（目前為 `https://lucas950219.github.io`）。後端用 `.env` 的 `DASHBOARD_ACCESS_TOKEN` 核對專屬連結的 `#view=` 值，金鑰與訂位明細留在後端。臨時通道網址改變後，需一併更新 LINE Webhook 和 Pages 的 API 網址。 [GitHub Pages 發布來源](https://docs.github.com/en/pages/getting-started-with-github-pages/configuring-a-publishing-source-for-your-github-pages-site)
+
+## 後續可討論的細節
+
+用餐時間、相鄰桌安排、特殊公休日與可提前預訂天數。
