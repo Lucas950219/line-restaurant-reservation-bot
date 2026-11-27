@@ -1,0 +1,111 @@
+<!doctype html>
+<html lang="zh-Hant">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="referrer" content="no-referrer">
+  <meta name="dashboard-api" content="https://anaheim-ericsson-dice-circular.trycloudflare.com/dashboard/reservations">
+  <title>餐廳營運後台</title>
+  <link rel="stylesheet" href="assets/style.css">
+  <script defer src="assets/dashboard.js"></script>
+</head>
+<body>
+  <header class="topbar">
+    <div class="topbar-inner">
+      <span class="brand-mark" aria-hidden="true"></span>
+      <span>餐廳營運後台</span>
+    </div>
+  </header>
+
+  <main class="shell">
+    <p id="access-note" class="access-note" role="status" hidden>請使用店家專屬檢視或管理連結開啟後台。</p>
+    <div class="heading">
+      <div>
+        <h1>訂位總覽</h1>
+        <p id="date-caption" class="muted"></p>
+      </div>
+      <div class="date-controls" aria-label="切換營業日期">
+        <button id="previous" type="button">前一天</button>
+        <input id="day" type="date" aria-label="營業日期">
+        <button id="next" type="button">後一天</button>
+        <button id="today" type="button" class="button-quiet">今天</button>
+      </div>
+    </div>
+
+    <section class="metrics" aria-label="當日訂位統計">
+      <article class="metric metric-total">
+        <span>已訂位人數</span>
+        <div><strong id="total-guests">—</strong><small>位</small></div>
+        <p><span id="total-bookings">—</span> 筆訂位</p>
+        <ul id="total-table-breakdown" class="table-breakdown"></ul>
+      </article>
+      <article class="metric">
+        <span>午餐訂位</span>
+        <div><strong id="lunch-guests">—</strong><small>位</small></div>
+        <p>11:30–14:30 · <span id="lunch-bookings">—</span> 筆</p>
+        <ul id="lunch-table-breakdown" class="table-breakdown"></ul>
+      </article>
+      <article class="metric">
+        <span>晚餐訂位</span>
+        <div><strong id="dinner-guests">—</strong><small>位</small></div>
+        <p>17:00–20:00 · <span id="dinner-bookings">—</span> 筆</p>
+        <ul id="dinner-table-breakdown" class="table-breakdown"></ul>
+      </article>
+    </section>
+
+    <section class="panel prep" aria-labelledby="prep-title">
+      <div class="prep-settings">
+        <h2 id="prep-title">備餐估算</h2>
+        <p class="muted">依已訂位人數估算，各餐期份數無條件進位。</p>
+        <div class="prep-inputs">
+          <label for="portions">每人份數<input id="portions" type="number" value="1" min="0" max="20" step="0.1" inputmode="decimal"></label>
+          <label for="buffer">備量比例（%）<input id="buffer" type="number" value="10" min="0" max="100" step="1" inputmode="numeric"></label>
+        </div>
+        <p id="estimate-error" class="notice" role="status" hidden>請填入每人 0–20 份和 0–100% 的備量。</p>
+      </div>
+      <dl class="estimates">
+        <div><dt>午餐</dt><dd><strong id="lunch-portions">—</strong> 份</dd></div>
+        <div><dt>晚餐</dt><dd><strong id="dinner-portions">—</strong> 份</dd></div>
+        <div class="estimates-total"><dt>全日合計</dt><dd><strong id="total-portions">—</strong> 份</dd></div>
+      </dl>
+    </section>
+
+    <section id="management-panel" class="panel management" aria-labelledby="management-title" hidden>
+      <h2 id="management-title">電話或現場訂位補登</h2>
+      <form id="manual-form" class="management-form" autocomplete="off">
+        <label for="manual-day">日期<input id="manual-day" type="date" required></label>
+        <label for="manual-time">入座時間<input id="manual-time" type="time" required></label>
+        <label for="manual-people">人數<input id="manual-people" type="number" min="1" max="36" step="1" required></label>
+        <label for="manual-contact">聯絡方式（選填）<input id="manual-contact" type="text" maxlength="254"></label>
+        <button type="submit" class="primary-action">補登訂位</button>
+      </form>
+      <div id="manual-splits" class="split-actions" hidden></div>
+      <p id="management-status" class="management-status muted" role="status" hidden></p>
+    </section>
+
+    <section class="panel reservations" aria-labelledby="reservations-title">
+      <div class="panel-heading">
+        <div><h2 id="reservations-title">訂位明細</h2><p id="status" class="muted" role="status">載入中…</p></div>
+        <button id="refresh" type="button">重新整理</button>
+      </div>
+      <div class="table-scroll" id="table-container" hidden>
+        <table>
+          <thead><tr><th scope="col">時間</th><th scope="col">餐期</th><th scope="col">訂位編號</th><th scope="col">總人數</th><th scope="col">雙人桌</th><th scope="col">四人桌</th><th id="manage-column" scope="col" hidden>訂位操作</th></tr></thead>
+          <tbody id="reservation-rows"></tbody>
+        </table>
+      </div>
+      <p id="empty" class="empty" hidden>這天目前沒有已成立的訂位。</p>
+    </section>
+  </main>
+  <dialog id="move-dialog" aria-labelledby="move-title">
+    <h2 id="move-title">訂位改期</h2>
+    <form id="move-form" class="management-form">
+      <label for="move-day">新日期<input id="move-day" type="date" required></label>
+      <label for="move-time">新時間<input id="move-time" type="time" required></label>
+      <button type="submit" class="primary-action">確認改期</button>
+      <button id="close-move" type="button">關閉</button>
+    </form>
+    <p id="move-status" class="management-status muted" role="status" hidden></p>
+  </dialog>
+</body>
+</html>
